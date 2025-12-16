@@ -18,7 +18,16 @@ router.post(
   upload.single("image"),
   async (req: TokenRequest, res: Response) => {
     try {
-      const tokenData = req.body;
+      console.log('Create token request:', {
+        ...req.body,
+        mayhemMode: req.body.mayhemMode
+      });
+
+      const tokenData = {
+        ...req.body,
+        // Convert mayhemMode from string to boolean if it exists
+        mayhemMode: true
+      };
 
       if (req.file) {
         tokenData.imageBuffer = req.file.buffer;

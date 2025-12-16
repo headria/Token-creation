@@ -3,6 +3,7 @@ import {
   Keypair,
   PublicKey,
   SystemProgram,
+  SYSVAR_RENT_PUBKEY,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
@@ -15,7 +16,7 @@ import { utils, web3 } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import { JitoBundler } from "../jito/jitoService";
 import dotenv from "dotenv";
-import { PinataService } from "../pinata/index";
+import { FilebaseService } from "../filebase";
 import PumpfunTokens from "../db/models/pumpfun.tokens";
 
 dotenv.config();
@@ -33,6 +34,7 @@ interface TokenCreationRequest {
   buyAmount?: number;
   description?: string; // Optional description
   extensions?: { [key: string]: string } | null; // Optional social media links
+  mayhemMode?: boolean; // Enable mayhem mode for this token
 }
 
 export class TokenService {
@@ -41,7 +43,7 @@ export class TokenService {
   private readonly programId: PublicKey = new PublicKey(
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
   );
-  private readonly pinataService: PinataService;
+  private readonly filebaseService: FilebaseService;
   private readonly sequelize: any; // Sequelize instance
   private readonly SEEDS = {
     MINT_AUTHORITY: utils.bytes.utf8.encode("mint-authority"),
@@ -64,7 +66,7 @@ export class TokenService {
     const rpcUrl = process.env.RPC_URL || "https://api.devnet.solana.com";
     this.connection = new Connection(rpcUrl, "confirmed");
     this.jitoBundler = new JitoBundler("1000000", this.connection);
-    this.pinataService = new PinataService();
+    this.filebaseService = new FilebaseService();
     this.sequelize = require("../db/database").sequelize; // Assuming sequelize is exported from database.ts
   }
 
@@ -74,82 +76,131 @@ export class TokenService {
       const creatorKeypair = this.getCreatorKeypair(req.creatorKeypair);
       const { tokenMint, bondingCurve, associatedBondingCurve } =
         await this.findAvailableAccounts();
-      const { uri, imageUrl } = await this.pinataService.uploadMetadata(req);
-      const latestBlockhash = await this.connection.getLatestBlockhash(
-        "confirmed"
-      );
+
+      console.log('Found available accounts:', {
+        tokenMint: tokenMint.publicKey.toBase58(),
+        bondingCurve: bondingCurve.toBase58(),
+        associatedBondingCurve: associatedBondingCurve.toBase58()
+      });
+
+      // Upload metadata first
+      const { uri, imageUrl } = await this.filebaseService.uploadMetadata(req);
+      console.log('Uploaded metadata:', { uri, imageUrl });
+
+      const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
+      console.log('Latest blockhash:', latestBlockhash.blockhash);
+
+      // Create the main token creation instruction
       const pumpFunInstruction = await this.createPumpFunInstruction(
         tokenMint.publicKey,
-        creatorKeypair.publicKey,
+        creatorKeypair,
         { ...req, uri }
       );
+
       const transaction = new Transaction().add(pumpFunInstruction);
-
-      if (req.buyAmount && req.buyAmount > 0) {
-        const associatedUser = await web3.PublicKey.findProgramAddressSync(
-          [
-            creatorKeypair.publicKey.toBuffer(),
-            TOKEN_PROGRAM_ID.toBuffer(),
-            tokenMint.publicKey.toBuffer(),
-          ],
-          ASSOCIATED_TOKEN_PROGRAM_ID
-        )[0];
-
-        const createATAInstruction = createAssociatedTokenAccountInstruction(
-          creatorKeypair.publicKey,
-          associatedUser,
-          creatorKeypair.publicKey,
-          tokenMint.publicKey
-        );
-        transaction.add(createATAInstruction);
-
-        const buyInstruction = await this.createBuyInstruction(
-          tokenMint.publicKey,
-          creatorKeypair.publicKey,
-          bondingCurve,
-          associatedBondingCurve,
-          associatedUser,
-          req.buyAmount
-        );
-        transaction.add(buyInstruction);
-      }
-
       transaction.feePayer = creatorKeypair.publicKey;
       transaction.recentBlockhash = latestBlockhash.blockhash;
+
+      // If buyAmount is specified, add the buy operation
+      // if (req.buyAmount && req.buyAmount > 0) {
+      //   console.log('Adding buy operation with amount:', req.buyAmount);
+
+      //   const associatedUser = await web3.PublicKey.findProgramAddress(
+      //     [
+      //       creatorKeypair.publicKey.toBuffer(),
+      //       TOKEN_PROGRAM_ID.toBuffer(),
+      //       tokenMint.publicKey.toBuffer(),
+      //     ],
+      //     ASSOCIATED_TOKEN_PROGRAM_ID
+      //   );
+
+      //   console.log('Associated user token account:', associatedUser[0].toBase58());
+
+      //   const createATAInstruction = createAssociatedTokenAccountInstruction(
+      //     creatorKeypair.publicKey,
+      //     associatedUser[0],
+      //     creatorKeypair.publicKey,
+      //     tokenMint.publicKey
+      //   );
+
+      //   transaction.add(createATAInstruction);
+
+      //   const buyInstruction = await this.createBuyInstruction(
+      //     tokenMint.publicKey,
+      //     creatorKeypair.publicKey,
+      //     bondingCurve,
+      //     associatedBondingCurve,
+      //     associatedUser[0],
+      //     req.buyAmount
+      //   );
+
+      //   transaction.add(buyInstruction);
+      // }
+
+      // Sign the transaction
       transaction.sign(tokenMint, creatorKeypair);
 
-      await this.simulateTransaction(transaction);
-      const result = await this.submitTransaction(
-        transaction,
-        creatorKeypair,
-        latestBlockhash,
-        tokenMint
-      );
-
-      if (result.success && result.signature && result.mintAddress) {
-        // Store token data in the database
-        await this.storeTokenData({
-          ...req,
-          extensions: req.extensions || null,
-          name: req.name,
-          symbol: req.symbol,
-          creatorKeypair: req.creatorKeypair,
-          buyAmount: req.buyAmount,
-          tokenMint: result.mintAddress,
-          image: imageUrl,
-          description: req.description || null,
-          bondingCurveAddress: bondingCurve.toBase58(),
-          associatedBondingCurveAddress: associatedBondingCurve.toBase58(),
-          signature: result.signature,
-          uri,
-        });
+      // Simulate the transaction first
+      console.log('Simulating transaction...');
+      const simulation = await this.connection.simulateTransaction(transaction);
+      if (simulation.value.err) {
+        console.error('Transaction simulation failed:', simulation.value.logs);
+        throw new Error(`Transaction simulation failed: ${JSON.stringify(simulation.value.err)}`);
       }
 
-      return result;
+      console.log('Transaction simulation successful. Submitting transaction...');
+      const signature = await this.connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed'
+      });
+
+      console.log('Transaction submitted, signature:', signature);
+
+      // Confirm the transaction
+      const confirmation = await this.connection.confirmTransaction({
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, 'confirmed');
+
+      console.log('Transaction confirmed:', confirmation);
+
+      if (confirmation.value.err) {
+        throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+
+      // Store token data in the database
+      const tokenData = {
+        ...req,
+        extensions: req.extensions || null,
+        name: req.name,
+        symbol: req.symbol,
+        creatorKeypair: req.creatorKeypair,
+        buyAmount: req.buyAmount,
+        tokenMint: tokenMint.publicKey.toBase58(),
+        image: imageUrl,
+        description: req.description || null,
+        bondingCurveAddress: bondingCurve.toBase58(),
+        associatedBondingCurveAddress: associatedBondingCurve.toBase58(),
+        signature,
+        uri,
+      };
+
+      await this.storeTokenData(tokenData);
+      console.log('Token data stored successfully');
+
+      return {
+        success: true,
+        signature,
+        mintAddress: tokenMint.publicKey.toBase58(),
+        message: 'Token created and bought successfully'
+      };
+
     } catch (error) {
+      console.error('Error in createPumpFunToken:', error);
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
@@ -167,6 +218,7 @@ export class TokenService {
     associatedBondingCurveAddress: string;
     signature: string;
     extensions: { [key: string]: string } | null;
+    mayhemMode?: boolean;
   }) {
     try {
       const STANDARD_INITIAL_SUPPLY = 1_000_000_000;
@@ -201,6 +253,7 @@ export class TokenService {
         signature: data.signature,
         status: "bonding", // Default status
         initialBuyAmount,
+        mayhemMode: data.mayhemMode || false,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -209,8 +262,7 @@ export class TokenService {
     } catch (error) {
       console.error("Failed to store token data:", error);
       throw new Error(
-        `Failed to store token data: ${
-          error instanceof Error ? error.message : "Unknown error"
+        `Failed to store token data: ${error instanceof Error ? error.message : "Unknown error"
         }`
       );
     }
@@ -238,8 +290,7 @@ export class TokenService {
     } catch (error) {
       console.error("Failed to store token data:", error);
       throw new Error(
-        `Failed to store token data: ${
-          error instanceof Error ? error.message : "Unknown error"
+        `Failed to store token data: ${error instanceof Error ? error.message : "Unknown error"
         }`
       );
     }
@@ -269,8 +320,8 @@ export class TokenService {
       throw new Error("URI must be 200 characters or less");
     }
 
-    if (req.imageBuffer && req.imageBuffer.length > 1_000_000) {
-      throw new Error("Image file must be less than 1MB for Pinata free tier");
+    if (req.imageBuffer && req.imageBuffer.length > 100_000_000) {
+      throw new Error("Image file must be less than 100MB for Filebase");
     }
 
     if (req.external_url && !/^(https?:\/\/)/.test(req.external_url)) {
@@ -489,92 +540,145 @@ export class TokenService {
   }
 
   private async createPumpFunInstruction(
-    mint: PublicKey,
-    creator: PublicKey,
-    tokenData: TokenCreationRequest
+    tokenMint: PublicKey,
+    creatorKeypair: Keypair,
+    req: TokenCreationRequest
   ): Promise<TransactionInstruction> {
-    const discriminator = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]);
-    const mintAuthority = web3.PublicKey.findProgramAddressSync(
+    // Derive PDAs
+    const [mintAuthority] = await PublicKey.findProgramAddress(
       [this.SEEDS.MINT_AUTHORITY],
       this.programId
-    )[0];
-    const bondingCurve = web3.PublicKey.findProgramAddressSync(
-      [this.SEEDS.BONDING_CURVE, mint.toBuffer()],
+    );
+
+    const [bondingCurve] = await PublicKey.findProgramAddress(
+      [this.SEEDS.BONDING_CURVE, tokenMint.toBuffer()],
       this.programId
-    )[0];
-    const associatedBondingCurve = web3.PublicKey.findProgramAddressSync(
-      [
-        bondingCurve.toBuffer(),
-        this.SEEDS.ASSOCIATED_BONDING_CURVE_CONSTANT,
-        mint.toBuffer(),
-      ],
-      new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-    )[0];
-    const global = web3.PublicKey.findProgramAddressSync(
+    );
+
+    const [global] = await PublicKey.findProgramAddress(
       [this.SEEDS.GLOBAL],
       this.programId
-    )[0];
-    const metadata = web3.PublicKey.findProgramAddressSync(
-      [
-        utils.bytes.utf8.encode("metadata"),
-        this.SEEDS.METADATA_CONSTANT,
-        mint.toBuffer(),
-      ],
-      new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s")
-    )[0];
-    const eventAuthority = web3.PublicKey.findProgramAddressSync(
+    );
+
+    // Mayhem mode program ID
+    const mayhemProgramId = new PublicKey('MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e');
+
+    // Find mayhem state PDA
+    const [mayhemState] = await PublicKey.findProgramAddress(
+      [Buffer.from('mayhem-state'), tokenMint.toBuffer()],
+      mayhemProgramId
+    );
+
+    // Find global params PDA
+    const [globalParams] = await PublicKey.findProgramAddress(
+      [Buffer.from('global-params')],
+      mayhemProgramId
+    );
+
+    // Find SOL vault PDA
+    const [solVault] = await PublicKey.findProgramAddress(
+      [Buffer.from('sol-vault')],
+      mayhemProgramId
+    );
+
+    // Token program ID for SPL Token 2022
+    const tokenProgramId = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+    const associatedTokenProgramId = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+
+    // Find mayhem token vault PDA
+    const [mayhemTokenVault] = await PublicKey.findProgramAddress(
+      [solVault.toBuffer(), tokenProgramId.toBuffer(), tokenMint.toBuffer()],
+      associatedTokenProgramId
+    );
+
+    // Find associated token account for the bonding curve
+    const [associatedBondingCurve] = await PublicKey.findProgramAddress(
+      [bondingCurve.toBuffer(), tokenProgramId.toBuffer(), tokenMint.toBuffer()],
+      associatedTokenProgramId
+    );
+
+    // Find event authority
+    const [eventAuthority] = await PublicKey.findProgramAddress(
       [this.SEEDS.EVENT_AUTHORITY],
       this.programId
-    )[0];
+    );
 
-    const nameBuffer = Buffer.from(tokenData.name);
-    const symbolBuffer = Buffer.from(tokenData.symbol);
-    const uriBuffer = Buffer.from(tokenData.uri || "");
-
-    const data = Buffer.concat([
-      discriminator,
-      Buffer.from([nameBuffer.length, 0, 0, 0]),
-      nameBuffer,
-      Buffer.from([symbolBuffer.length, 0, 0, 0]),
-      symbolBuffer,
-      Buffer.from([uriBuffer.length, 0, 0, 0]),
-      uriBuffer,
-      creator.toBuffer(),
-    ]);
-
-    const accounts = [
-      { pubkey: mint, isSigner: true, isWritable: true },
-      { pubkey: mintAuthority, isSigner: false, isWritable: false },
-      { pubkey: bondingCurve, isSigner: false, isWritable: true },
-      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-      { pubkey: global, isSigner: false, isWritable: false },
-      {
-        pubkey: new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"),
-        isSigner: false,
-        isWritable: false,
-      },
-      { pubkey: metadata, isSigner: false, isWritable: true },
-      { pubkey: creator, isSigner: true, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      {
-        pubkey: new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
-        isSigner: false,
-        isWritable: false,
-      },
-      {
-        pubkey: new PublicKey("SysvarRent111111111111111111111111111111111"),
-        isSigner: false,
-        isWritable: false,
-      },
-      { pubkey: eventAuthority, isSigner: false, isWritable: false },
-      { pubkey: this.programId, isSigner: false, isWritable: false },
+    // Create the instruction accounts - ordered exactly as in IDL
+    const keys = [
+      { pubkey: tokenMint, isSigner: true, isWritable: true },          // 0. [signer] The mint account
+      { pubkey: mintAuthority, isSigner: false, isWritable: false },    // 1. [] The mint authority
+      { pubkey: bondingCurve, isSigner: false, isWritable: true },      // 2. [writable] The bonding curve
+      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true }, // 3. [writable] Associated token account
+      { pubkey: global, isSigner: false, isWritable: false },           // 4. [] The global account
+      { pubkey: creatorKeypair.publicKey, isSigner: true, isWritable: true }, // 5. [signer, writable] Creator
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // 6. [] System program
+      { pubkey: tokenProgramId, isSigner: false, isWritable: false },   // 7. [] Token program (SPL Token 2022)
+      { pubkey: associatedTokenProgramId, isSigner: false, isWritable: false }, // 8. [] Associated token program
+      { pubkey: mayhemProgramId, isSigner: false, isWritable: true },   // 9. [writable] Mayhem program
+      { pubkey: globalParams, isSigner: false, isWritable: false },     // 10. [] Global params
+      { pubkey: solVault, isSigner: false, isWritable: true },          // 11. [writable] SOL vault
+      { pubkey: mayhemState, isSigner: false, isWritable: true },       // 12. [writable] Mayhem state
+      { pubkey: mayhemTokenVault, isSigner: false, isWritable: true },  // 13. [writable] Mayhem token vault
+      { pubkey: eventAuthority, isSigner: false, isWritable: false },   // 14. [] Event authority
+      { pubkey: this.programId, isSigner: false, isWritable: false }    // 15. [] Program ID
     ];
 
+    // Calculate buffer size
+    const nameLength = req.name.length;
+    const symbolLength = req.symbol.length;
+    const uri = req.uri || '';
+    const uriLength = uri.length;
+
+    // Calculate total size needed:
+    // 8 bytes discriminator + 
+    // 4 (name len) + name + 
+    // 4 (symbol len) + symbol + 
+    // 4 (uri len) + uri + 
+    // 32 (creator pubkey) + 
+    // 1 (mayhem mode)
+    const bufferSize = 8 + 4 + nameLength + 4 + symbolLength + 4 + uriLength + 32 + 1;
+
+    // Create buffer with exact size
+    const data = Buffer.alloc(bufferSize);
+    let offset = 0;
+
+    // Add discriminator for create_v2 (8 bytes) - Using the correct discriminator from IDL
+    const discriminator = [214, 144, 76, 236, 95, 139, 49, 180];
+    for (let i = 0; i < discriminator.length; i++) {
+      data.writeUInt8(discriminator[i], offset++);
+    }
+
+    // Add name (4 bytes length + string)
+    data.writeUInt32LE(nameLength, offset);
+    offset += 4;
+    data.write(req.name, offset, 'utf8');
+    offset += nameLength;
+
+    // Add symbol (4 bytes length + string)
+    data.writeUInt32LE(symbolLength, offset);
+    offset += 4;
+    data.write(req.symbol, offset, 'utf8');
+    offset += symbolLength;
+
+    // Add URI (4 bytes length + string)
+    data.writeUInt32LE(uriLength, offset);
+    offset += 4;
+    data.write(uri, offset, 'utf8');
+    offset += uriLength;
+
+    // Add creator pubkey (32 bytes) - using the creator keypair's public key
+    data.write(creatorKeypair.publicKey.toBuffer().toString('hex'), offset, 'hex');
+    offset += 32;
+
+    // Add mayhem mode (1 byte) - default to false if not specified
+    const mayhemMode = req.mayhemMode || false;
+    data.writeUInt8(mayhemMode ? 1 : 0, offset);
+    offset += 1;
+
     return new TransactionInstruction({
-      keys: accounts,
       programId: this.programId,
-      data,
+      keys,
+      data
     });
   }
 
@@ -587,51 +691,57 @@ export class TokenService {
     buyAmount: number
   ): Promise<TransactionInstruction> {
     try {
-      const discriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
-      const global = web3.PublicKey.findProgramAddressSync(
+      console.log('Creating buy instruction with params:', {
+        mint: mint.toBase58(),
+        user: user.toBase58(),
+        bondingCurve: bondingCurve.toBase58(),
+        associatedBondingCurve: associatedBondingCurve.toBase58(),
+        associatedUser: associatedUser.toBase58(),
+        buyAmount
+      });
+
+      // 1. Find all required PDAs
+      const [global] = web3.PublicKey.findProgramAddressSync(
         [this.SEEDS.GLOBAL],
         this.programId
-      )[0];
-      const creatorVault = web3.PublicKey.findProgramAddressSync(
-        [this.SEEDS.CREATOR_VAULT, user.toBuffer()],
-        this.programId
-      )[0];
-      const eventAuthority = web3.PublicKey.findProgramAddressSync(
-        [this.SEEDS.EVENT_AUTHORITY],
-        this.programId
-      )[0];
-      const feeRecipient = new PublicKey(
-        "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
       );
 
-      // Convert buyAmount from SOL to lamports (1 SOL = 1,000,000,000 lamports)
-      const lamports = buyAmount * Math.pow(10, defaultDecimal);
-      const amountBuffer = Buffer.alloc(8);
-      amountBuffer.writeBigUInt64LE(BigInt(lamports));
+      const [eventAuthority] = web3.PublicKey.findProgramAddressSync(
+        [this.SEEDS.EVENT_AUTHORITY],
+        this.programId
+      );
 
-      // maxSolCost is slightly higher than buyAmount to account for slippage (in lamports)
-      const maxSolCost = Math.floor(lamports * 1.1);
+      // Add volume accumulator PDAs
+      const [globalVolumeAccumulator] = web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("global_volume_accumulator")],
+        this.programId
+      );
+
+      const [userVolumeAccumulator] = web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("user_volume_accumulator"), user.toBuffer()],
+        this.programId
+      );
+
+      // 2. Get fee recipient (using the same as in createPumpFunInstruction)
+      const feeRecipient = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
+
+      // 3. Prepare the instruction data
+      const discriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+      const amountBuffer = Buffer.alloc(8);
+      amountBuffer.writeBigUInt64LE(BigInt(Math.floor(buyAmount * 1e9))); // Convert SOL to lamports
+
+      // Add 10% slippage for maxSolCost
+      const maxSolCost = Math.floor(buyAmount * 1.1 * 1e9);
       const maxSolCostBuffer = Buffer.alloc(8);
       maxSolCostBuffer.writeBigUInt64LE(BigInt(maxSolCost));
 
       const data = Buffer.concat([
         discriminator,
         amountBuffer,
-        maxSolCostBuffer,
+        maxSolCostBuffer
       ]);
 
-      // Derive PDAs based on the IDL
-      const globalVolumeAccumulator = web3.PublicKey.findProgramAddressSync(
-        [utils.bytes.utf8.encode("global_volume_accumulator")],
-        this.programId
-      )[0];
-
-      const userVolumeAccumulator = web3.PublicKey.findProgramAddressSync(
-        [utils.bytes.utf8.encode("user_volume_accumulator"), user.toBuffer()],
-        this.programId
-      )[0];
-
-      // Construct the accounts list
+      // 4. Prepare all required accounts
       const accounts = [
         { pubkey: global, isSigner: false, isWritable: false }, // global
         { pubkey: feeRecipient, isSigner: false, isWritable: true }, // fee_recipient
@@ -642,21 +752,27 @@ export class TokenService {
         { pubkey: user, isSigner: true, isWritable: true }, // user
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // system_program
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // token_program
-        { pubkey: creatorVault, isSigner: false, isWritable: true }, // creator_vault
+        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false }, // rent
         { pubkey: eventAuthority, isSigner: false, isWritable: false }, // event_authority
         { pubkey: this.programId, isSigner: false, isWritable: false }, // program
         { pubkey: globalVolumeAccumulator, isSigner: false, isWritable: true }, // global_volume_accumulator
         { pubkey: userVolumeAccumulator, isSigner: false, isWritable: true }, // user_volume_accumulator
       ];
 
+      console.log('Buy instruction accounts:', accounts.map(a => ({
+        pubkey: a.pubkey.toBase58(),
+        isSigner: a.isSigner,
+        isWritable: a.isWritable
+      })));
+
       return new TransactionInstruction({
-        keys: accounts,
         programId: this.programId,
-        data,
+        keys: accounts,
+        data
       });
     } catch (error) {
-      console.error("Error creating buy instruction:", error);
-      throw error;
+      console.error('Error in createBuyInstruction:', error);
+      throw new Error(`Failed to create buy instruction: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 }
