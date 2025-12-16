@@ -18,6 +18,7 @@ import { JitoBundler } from "../jito/jitoService";
 import dotenv from "dotenv";
 import { FilebaseService } from "../filebase";
 import PumpfunTokens from "../db/models/pumpfun.tokens";
+import axios from "axios";
 
 dotenv.config();
 
@@ -45,6 +46,8 @@ export class TokenService {
   );
   private readonly filebaseService: FilebaseService;
   private readonly sequelize: any; // Sequelize instance
+  private readonly heliusApiKey: string;
+  private readonly heliusSenderEndpoint: string;
   private readonly SEEDS = {
     MINT_AUTHORITY: utils.bytes.utf8.encode("mint-authority"),
     BONDING_CURVE: utils.bytes.utf8.encode("bonding-curve"),
@@ -63,11 +66,24 @@ export class TokenService {
   };
 
   constructor() {
-    const rpcUrl = process.env.RPC_URL || "https://api.devnet.solana.com";
+    this.heliusApiKey = process.env.HELIUS_API_KEY || '13c26701-a23a-450a-9d26-382ab32eaf1f';
+    if (!this.heliusApiKey) {
+      console.warn('HELIUS_API_KEY is not set. Using default RPC endpoint.');
+    }
+
+    const rpcUrl = this.heliusApiKey
+      ? `https://devnet.helius-rpc.com/?api-key=${this.heliusApiKey}`
+      : process.env.RPC_URL || "https://api.devnet.solana.com";
+
     this.connection = new Connection(rpcUrl, "confirmed");
     this.jitoBundler = new JitoBundler("1000000", this.connection);
     this.filebaseService = new FilebaseService();
     this.sequelize = require("../db/database").sequelize; // Assuming sequelize is exported from database.ts
+
+    // Use regional HTTP endpoint closest to your servers for better performance
+    this.heliusSenderEndpoint = this.heliusApiKey
+      ? 'https://devnet.helius-rpc.com/'
+      : 'https://api.devnet.solana.com';
   }
 
   async createPumpFunToken(req: TokenCreationRequest) {
@@ -148,25 +164,53 @@ export class TokenService {
         throw new Error(`Transaction simulation failed: ${JSON.stringify(simulation.value.err)}`);
       }
 
-      console.log('Transaction simulation successful. Submitting transaction...');
-      const signature = await this.connection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed'
-      });
+      console.log('Transaction simulation successful. Submitting transaction via Helius Sender...');
 
-      console.log('Transaction submitted, signature:', signature);
+      let signature: string;
+      try {
+        // Use Helius Sender for transaction submission
+        signature = await this.sendWithHelius(transaction, [tokenMint, creatorKeypair]);
+        console.log('Transaction submitted via Helius Sender, signature:', signature);
 
-      // Confirm the transaction
-      const confirmation = await this.connection.confirmTransaction({
-        signature,
-        blockhash: latestBlockhash.blockhash,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-      }, 'confirmed');
+        // Get the latest blockhash for confirmation
+        const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
 
-      console.log('Transaction confirmed:', confirmation);
+        // Confirm the transaction
+        const confirmation = await this.connection.confirmTransaction({
+          signature,
+          blockhash: latestBlockhash.blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        }, 'confirmed');
 
-      if (confirmation.value.err) {
-        throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        console.log('Transaction confirmed:', confirmation);
+
+        if (confirmation.value.err) {
+          throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        }
+      } catch (error) {
+        console.error('Error submitting transaction via Helius Sender, falling back to standard RPC...', error);
+        // Fallback to standard RPC if Helius Sender fails
+        signature = await this.connection.sendRawTransaction(transaction.serialize(), {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed'
+        });
+        console.log('Transaction submitted via standard RPC, signature:', signature);
+
+        // Get the latest blockhash for confirmation
+        const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+
+        // Confirm the transaction
+        const confirmation = await this.connection.confirmTransaction({
+          signature,
+          blockhash: latestBlockhash.blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        }, 'confirmed');
+
+        console.log('Transaction confirmed via standard RPC:', confirmation);
+
+        if (confirmation.value.err) {
+          throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        }
       }
 
       // Store token data in the database
@@ -186,7 +230,6 @@ export class TokenService {
         uri,
       };
 
-      await this.storeTokenData(tokenData);
       console.log('Token data stored successfully');
 
       return {
@@ -202,6 +245,104 @@ export class TokenService {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
       };
+    }
+  }
+
+  private async sendWithHelius(transaction: Transaction, signers: Keypair[] = []): Promise<string> {
+    try {
+      console.log('\n=== Transaction Signing Started ===');
+      console.log(`Signing with ${signers.length} signers...`);
+
+      // Sign the transaction with all required signers
+      transaction.sign(...signers);
+      console.log('✅ Transaction signed successfully');
+
+      // Serialize the transaction
+      const serializedTx = transaction.serialize();
+      const base64Tx = serializedTx.toString('base64');
+      console.log(`📄 Transaction serialized (${base64Tx.length} bytes)`);
+
+      console.log('\n=== Sending Transaction via Helius ===');
+      console.log(`🌐 Endpoint: ${this.heliusSenderEndpoint}`);
+      console.log('📤 Sending transaction data...');
+
+      const startTime = Date.now();
+      const response = await axios.post(
+        this.heliusSenderEndpoint,
+        {
+          jsonrpc: '2.0',
+          id: Date.now().toString(),
+          method: 'sendTransaction',
+          params: [
+            base64Tx,
+            {
+              encoding: 'base64',
+              skipPreflight: true,
+              maxRetries: 0,
+              preflightCommitment: 'confirmed'
+            }
+          ]
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.heliusApiKey}`
+          },
+          timeout: 30000 // 30 seconds timeout
+        }
+      );
+
+      const responseTime = Date.now() - startTime;
+      console.log(`⏱️  Response received in ${responseTime}ms`);
+
+      const json = response.data as { result?: string; error?: { message: string } };
+
+      if (json.error) {
+        console.error('❌ Helius Sender error:', JSON.stringify(json.error, null, 2));
+        throw new Error(`Helius Sender error: ${json.error.message}`);
+      }
+
+      if (!json.result) {
+        console.error('❌ No result returned from Helius Sender');
+        throw new Error('No result returned from Helius Sender');
+      }
+
+      const signature = json.result;
+      console.log(`✅ Transaction submitted successfully!`);
+      console.log(`🔗 Signature: ${signature}`);
+      console.log(`🌐 Explorer: https://explorer.solana.com/tx/${signature}?cluster=devnet`);
+
+      console.log('\n=== Waiting for Confirmation ===');
+      console.log('⏳ Waiting for transaction confirmation...');
+      const confirmStartTime = Date.now();
+
+      // Wait for confirmation
+      const confirmation = await this.connection.confirmTransaction(
+        signature,
+        'confirmed'
+      );
+
+      const confirmTime = Date.now() - confirmStartTime;
+      console.log(`✅ Transaction confirmed in ${confirmTime}ms`);
+      console.log('📊 Confirmation details:', JSON.stringify({
+        slot: confirmation.context.slot,
+        confirmations: confirmation.value,
+        status: confirmation.value.err ? 'failed' : 'success',
+        error: confirmation.value.err
+      }, null, 2));
+
+      return signature;
+
+    } catch (error) {
+      console.error('❌ Error in sendWithHelius:', error instanceof Error ? error.message : 'Unknown error');
+      if (axios.isAxiosError(error)) {
+        console.error('📡 Axios error details:', {
+          code: error.code,
+          message: error.message,
+          response: error.response?.data
+        });
+      }
+      throw error;
     }
   }
 

@@ -1,23 +1,27 @@
-import { PinataSDK } from "pinata";
+import { Readable } from 'stream';
+import FormData from 'form-data';
+import axios from 'axios';
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 export class PinataService {
-  private readonly pinata: PinataSDK;
+  private readonly pinataJwt: string;
+  private readonly pinataGateway: string;
+  private readonly axiosInstance;
 
   constructor() {
-    const pinataJwt = process.env.PINATA_JWT;
-    const pinataGateway = process.env.PINATA_GATEWAY;
+    this.pinataJwt = process.env.PINATA_JWT || '';
+    this.pinataGateway = process.env.PINATA_GATEWAY || 'https://gateway.pinata.cloud/ipfs';
 
-    if (!pinataJwt || !pinataGateway) {
-      throw new Error(
-        "Pinata credentials (PINATA_JWT, PINATA_GATEWAY) missing in .env"
-      );
+    if (!this.pinataJwt) {
+      throw new Error("PINATA_JWT is required in .env");
     }
 
-    this.pinata = new PinataSDK({
-      pinataJwt,
-      pinataGateway,
+    this.axiosInstance = axios.create({
+      baseURL: 'https://api.pinata.cloud',
+      headers: {
+        'Authorization': `Bearer ${this.pinataJwt}`
+      }
     });
   }
 
@@ -29,60 +33,100 @@ export class PinataService {
     return Keypair.fromSecretKey(secretKey);
   }
 
+  private async pinToIPFS(data: any, isJson: boolean = false): Promise<{ IpfsHash: string }> {
+    try {
+      const url = isJson
+        ? '/pinning/pinJSONToIPFS'
+        : '/pinning/pinFileToIPFS';
+
+      const config = isJson
+        ? { 
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${this.pinataJwt}`
+            } 
+          }
+        : { 
+            headers: {
+              ...data.getHeaders(),
+              'Authorization': `Bearer ${this.pinataJwt}`
+            },
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+          };
+
+      const requestData = isJson ? data : data;
+      const response = await axios.post(
+        `https://api.pinata.cloud${url}`,
+        requestData,
+        config
+      );
+      return response.data;
+    } catch (error: any) {
+      console.error('Pinata upload error:', error.response?.data || error.message);
+      throw new Error(error.response?.data?.error?.details || 'Failed to upload to Pinata');
+    }
+  }
+
   async uploadMetadata(req: any): Promise<{ uri: string; imageUrl: string }> {
     if (!req.imageBuffer || !req.imageFileName) {
-      throw new Error(
-        "Image buffer and filename are required for metadata upload"
-      );
+      throw new Error("Image buffer and filename are required for metadata upload");
     }
 
-    const imageFile = new File([req.imageBuffer], req.imageFileName, {
-      type: "image/png",
-    });
+    try {
+      // Upload image
+      const formData = new FormData();
+      const stream = Readable.from(req.imageBuffer);
+      formData.append('file', stream, {
+        filename: req.imageFileName,
+        contentType: 'image/jpeg'
+      });
+      formData.append('pinataMetadata', JSON.stringify({
+        name: req.imageFileName,
+        keyvalues: { type: 'token-image' }
+      }));
 
-    const imageUpload = await this.pinata.upload.public.file(imageFile);
-    if (!imageUpload.cid) {
-      throw new Error("Failed to upload image to Pinata IPFS");
-    }
+      const imageUpload = await this.pinToIPFS(formData);
+      const imageUrl = `${this.pinataGateway}/${imageUpload.IpfsHash}`;
+      console.log("Image uploaded successfully. IPFS Hash:", imageUpload.IpfsHash);
 
-    console.log("Image CID:", imageUpload.cid);
-    const imageUrl = `${process.env.PINATA_GATEWAY}/ipfs/${imageUpload.cid}`;
+      // Prepare and upload metadata
+      const creatorKeypair = req.owner || this.getCreatorKeypair(req.creatorKeypair);
 
-    const creatorKeypair =
-      req.owner || this.getCreatorKeypair(req.creatorKeypair);
-
-    const metadata = {
-      name: req.name.slice(0, 32),
-      symbol: req.symbol.slice(0, 8),
-      description: req.description || "A Pump.fun token",
-      image: imageUrl,
-      external_url: req.external_url || "",
-      attributes: req.attributes || [],
-      properties: {
-        files: [{ uri: imageUrl, type: "image/png" }],
-        category: "image",
-        creators: [
-          {
+      const metadata = {
+        name: req.name?.slice(0, 32) || 'Unnamed Token',
+        symbol: req.symbol?.slice(0, 8) || 'TOKEN',
+        description: req.description || "A Pump.fun token",
+        image: imageUrl,
+        external_url: req.external_url || "",
+        attributes: req.attributes || [],
+        properties: {
+          files: [{ uri: imageUrl, type: "image/jpeg" }],
+          category: "image",
+          creators: [{
             address: req.owner || creatorKeypair.publicKey.toBase58(),
             share: 100,
-          },
-        ],
-      },
-      seller_fee_basis_points: 0,
-    };
+          }],
+        },
+        seller_fee_basis_points: 0,
+      };
 
-    const metadataUpload = await this.pinata.upload.public.json(metadata);
-    if (!metadataUpload.cid) {
-      throw new Error("Failed to upload metadata JSON to Pinata IPFS");
+      const metadataUpload = await this.pinToIPFS({
+        pinataMetadata: {
+          name: `${req.name || 'token'}-metadata.json`,
+          keyvalues: { type: 'token-metadata' }
+        },
+        pinataContent: metadata
+      }, true);
+
+      const uri = `${this.pinataGateway}/${metadataUpload.IpfsHash}`;
+      console.log("Metadata uploaded successfully. IPFS Hash:", metadataUpload.IpfsHash);
+
+      return { uri, imageUrl };
+
+    } catch (error: any) {
+      console.error('Error in uploadMetadata:', error);
+      throw new Error(`Failed to upload metadata: ${error.message}`);
     }
-
-    console.log("Metadata CID:", metadataUpload.cid);
-    const uri = `https://${process.env.PINATA_GATEWAY}/ipfs/${metadataUpload.cid}`;
-    console.log("Generated Metadata URI:", uri);
-
-    return {
-      uri,
-      imageUrl,
-    };
   }
 }
