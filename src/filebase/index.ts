@@ -51,7 +51,7 @@ export class FilebaseService {
     });
   }
 
-  private async uploadToFilebase(content: Buffer, filename: string, contentType: string): Promise<string> {
+  public async uploadToFilebase(content: Buffer, filename: string, contentType: string): Promise<string> {
     try {
       const fileExt = filename.split('.').pop() || '';
       const key = `file-${Date.now()}-${Math.random().toString(36).substring(2, 8)}.${fileExt}`;

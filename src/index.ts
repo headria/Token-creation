@@ -26,7 +26,10 @@ app.use(
   })
 );
 
+// Parse JSON bodies
 app.use(express.json());
+// Parse URL-encoded bodies (for form data)
+app.use(express.urlencoded({ extended: true }));
 
 // --- Router Setup ---
 const router = Router();

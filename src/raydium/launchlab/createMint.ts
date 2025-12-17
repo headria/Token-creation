@@ -7,6 +7,7 @@ import {
   TransactionInstruction,
   TransactionMessage,
   PublicKey,
+  Transaction
 } from "@solana/web3.js";
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -30,11 +31,108 @@ import {
 } from "@raydium-io/raydium-sdk-v2";
 import { initSdk } from "../config";
 import { JitoTransactionExecutor } from "./executer";
-import dotenv from "dotenv";
 import { LaunchpadRequest } from "../types/types";
 import LaunchlabTokens from "../../db/models/letsBonk.launchlab";
+import { FilebaseService } from "../../filebase";
+import axios from "axios";
+import * as dotenv from 'dotenv';
 
 dotenv.config();
+
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
+const HELIUS_SENDER_ENDPOINT = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+
+async function sendWithHelius(transaction: VersionedTransaction): Promise<string> {
+  try {
+    console.log('\n=== Transaction Signing Started ===');
+    console.log(`Signing with ${transaction.signatures.length} signers...`);
+
+    // Serialize the transaction
+    const serializedTx = transaction.serialize();
+    const base64Tx = Buffer.from(serializedTx).toString('base64');
+    console.log(`📄 Transaction serialized (${base64Tx.length} bytes)`);
+
+    console.log('\n=== Sending Transaction via Helius ===');
+    console.log(`🌐 Endpoint: ${HELIUS_SENDER_ENDPOINT}`);
+    console.log('📤 Sending transaction data...');
+
+    const startTime = Date.now();
+    const response = await axios.post(
+      HELIUS_SENDER_ENDPOINT,
+      {
+        jsonrpc: '2.0',
+        id: Date.now().toString(),
+        method: 'sendTransaction',
+        params: [
+          base64Tx,
+          {
+            encoding: 'base64',
+            skipPreflight: true,
+            maxRetries: 0,
+            preflightCommitment: 'confirmed'
+          }
+        ]
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000 // 30 seconds timeout
+      }
+    );
+
+    const responseTime = Date.now() - startTime;
+    console.log(`⏱️  Response received in ${responseTime}ms`);
+
+    const json = response.data as { result?: string; error?: { message: string } };
+
+    if (json.error) {
+      console.error('❌ Helius Sender error:', JSON.stringify(json.error, null, 2));
+      throw new Error(`Helius Sender error: ${json.error.message}`);
+    }
+
+    if (!json.result) {
+      console.error('❌ No result returned from Helius Sender');
+      throw new Error('No result returned from Helius Sender');
+    }
+
+    const signature = json.result;
+    console.log(`✅ Transaction submitted successfully!`);
+    console.log(`🔗 Signature: ${signature}`);
+    console.log(`🌐 Explorer: https://explorer.solana.com/tx/${signature}`);
+
+    console.log('\n=== Waiting for Confirmation ===');
+    console.log('⏳ Waiting for transaction confirmation...');
+    const confirmStartTime = Date.now();
+
+    // Wait for confirmation
+    const confirmation = await connection.confirmTransaction(
+      signature,
+      'confirmed'
+    );
+
+    const confirmTime = Date.now() - confirmStartTime;
+    console.log(`✅ Transaction confirmed in ${confirmTime}ms`);
+    console.log('📊 Confirmation details:', JSON.stringify({
+      slot: confirmation.context.slot,
+      confirmations: confirmation.value,
+      status: confirmation.value.err ? 'failed' : 'success',
+      error: confirmation.value.err
+    }, null, 2));
+
+    return signature;
+  } catch (error) {
+    console.error('❌ Error in sendWithHelius:', error instanceof Error ? error.message : 'Unknown error');
+    if (axios.isAxiosError(error)) {
+      console.error('📡 Axios error details:', {
+        code: error.code,
+        message: error.message,
+        response: error.response?.data
+      });
+    }
+    throw error;
+  }
+}
 
 const BONK_PLATFROM_ID = new PublicKey(
   "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1"
@@ -45,63 +143,24 @@ const connection = new Connection(process.env.RPC_URL || "", {
   commitment,
 });
 
-const createImageMetadata = async (imageData: any) => {
-  const formData = new FormData();
-  try {
-    formData.append("image", new Blob([imageData]), "token-image.png");
+const filebaseService = new FilebaseService();
 
-    const uploadResponse = await fetch(
-      "https://storage.letsbonk.fun/upload/img",
-      {
-        method: "POST",
-        body: formData,
-      }
+const uploadImageToFilebase = async (imageData: Buffer, fileName: string): Promise<string> => {
+  try {
+    console.log("Uploading token image to Filebase...");
+    
+    // Upload image to Filebase
+    const imageUrl = await filebaseService.uploadToFilebase(
+      imageData, 
+      `images/${Date.now()}-${fileName || 'token.png'}`,
+      'image/png'
     );
-
-    if (!uploadResponse.ok) {
-      throw new Error(`Failed to upload image: ${uploadResponse.statusText}`);
-    }
-
-    const resultText = await uploadResponse.text();
-    console.log("Uploaded image link:", resultText);
-    return resultText;
+    
+    console.log('Image uploaded to Filebase:', imageUrl);
+    return imageUrl;
   } catch (error) {
-    console.error("Image upload failed:", error);
-    throw error;
-  }
-};
-
-const createBonkTokenMetadata = async (create: any) => {
-  const metadata = {
-    name: create.name,
-    symbol: create.symbol,
-    description: create.description,
-    createdOn: create.createdOn || "https://bonk.fun",
-    platformId: create.platformId,
-    image: create.image,
-    website: create.website || "https://bonk.fun",
-    twitter: create.twitter || "https://x.com/bonkfun",
-    telegram: create.telegram || "https://t.me/bonkfun",
-    showName: create.showName,
-  };
-
-  console.log("Metadata:", metadata);
-
-  try {
-    const response = await fetch("https://storage.letsbonk.fun/upload/meta", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(metadata),
-    });
-
-    const resultText = await response.text();
-    console.log("Metadata IPFS link:", resultText);
-    return resultText;
-  } catch (error) {
-    console.error("Metadata upload failed:", error);
-    throw error;
+    console.error('Error uploading image to Filebase:', error);
+    throw new Error(`Failed to upload image to Filebase: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 };
 
@@ -134,25 +193,63 @@ export const createBonkFunTokenMetadata = async (
     }
   }
 
-  const imageMetadata = await createImageMetadata(tokenData.image);
-  console.log("imageMetadata:", imageMetadata);
+  try {
+    console.log('Uploading token metadata to Filebase...');
+    
+    // Upload image to Filebase
+    const imageUrl = await uploadImageToFilebase(
+      tokenData.image,
+      tokenData.imageFileName || 'token.png'
+    );
+    
+    console.log('Image uploaded to Filebase:', imageUrl);
 
-  const tokenInfo = {
-    name: tokenData.name,
-    symbol: tokenData.symbol,
-    description: tokenData.description,
-    createdOn: tokenData.createdOn,
-    platformId: BONK_PLATFROM_ID.toBase58(),
-    image: imageMetadata,
-    website: tokenData.website,
-    twitter: tokenData.twitter,
-    telegram: tokenData.telegram,
-    showName: tokenData.showName || tokenData.name,
-  };
+    // Prepare metadata
+    const metadata = {
+      name: tokenData.name,
+      symbol: tokenData.symbol,
+      description: tokenData.description || '',
+      external_url: tokenData.website || 'https://bonk.fun',
+      image: imageUrl,
+      attributes: [
+        {
+          trait_type: 'Platform',
+          value: 'Bonk Launchpad'
+        },
+        {
+          trait_type: 'Created On',
+          value: tokenData.createdOn || 'Bonk Launchpad'
+        }
+      ],
+      properties: {
+        category: 'token',
+        files: [
+          {
+            uri: imageUrl,
+            type: 'image/png'
+          }
+        ]
+      }
+    };
 
-  const tokenMetadata = await createBonkTokenMetadata(tokenInfo);
-  console.log("tokenMetadata:", tokenMetadata);
-  return { uri: tokenMetadata, imageUrl: imageMetadata };
+    // Upload metadata to Filebase
+    const metadataBuffer = Buffer.from(JSON.stringify(metadata, null, 2));
+    const metadataUrl = await filebaseService.uploadToFilebase(
+      metadataBuffer,
+      `metadata/${Date.now()}-${tokenData.symbol.toLowerCase()}.json`,
+      'application/json'
+    );
+
+    console.log('Metadata uploaded to Filebase:', metadataUrl);
+    
+    return { 
+      uri: metadataUrl, 
+      imageUrl 
+    };
+  } catch (error) {
+    console.error('Error in createBonkFunTokenMetadata:', error);
+    throw new Error(`Failed to upload to Filebase: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
 };
 
 export const createBonkTokenTx = async (
@@ -258,14 +355,14 @@ export const createBonkTokenTx = async (
 
     const ixs = [...transactions[0].instructions];
 
-    if (tokenData.buyAmount && tokenData.buyAmount > 0) {
-      const buyInstruction = await makeBuyIx(
-        mainKp,
-        tokenData.buyAmount * LAMPORTS_PER_SOL,
-        mintKp.publicKey
-      );
-      ixs.push(...buyInstruction);
-    }
+    // if (tokenData.buyAmount && tokenData.buyAmount > 0) {
+    //   const buyInstruction = await makeBuyIx(
+    //     mainKp,
+    //     tokenData.buyAmount * LAMPORTS_PER_SOL,
+    //     mintKp.publicKey
+    //   );
+    //   ixs.push(...buyInstruction);
+    // }
 
     const { blockhash } = await connection.getLatestBlockhash();
     const messageV0 = new TransactionMessage({
@@ -285,6 +382,33 @@ export const createBonkTokenTx = async (
       "create token transaction simulate ==>",
       JSON.stringify(sim, null, 2)
     );
+
+    let signature: string;
+    
+    try {
+      // First try with Helius
+      console.log('\n=== Attempting to send transaction via Helius ===');
+      signature = await sendWithHelius(transaction);
+    } catch (error) {
+      console.warn('Helius submission failed, falling back to direct RPC:', error);
+      // Fall back to direct RPC submission
+      console.log('\n=== Sending transaction via direct RPC ===');
+      const txid = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+      });
+      
+      console.log('✅ Transaction submitted via RPC:', txid);
+      console.log(`🌐 Explorer: https://explorer.solana.com/tx/${txid}`);
+      
+      // Wait for confirmation
+      console.log('\n=== Waiting for Confirmation ===');
+      console.log('⏳ Waiting for transaction confirmation...');
+      const confirmation = await connection.confirmTransaction(txid, 'confirmed');
+      
+      console.log('✅ Transaction confirmed in slot:', confirmation.context.slot);
+      signature = txid;
+    }
 
     // Store token data in the database
     await storeTokenData({
@@ -384,8 +508,7 @@ const storeTokenData = async (data: {
   } catch (error) {
     console.error("Failed to store token data:", error);
     throw new Error(
-      `Failed to store token data: ${
-        error instanceof Error ? error.message : "Unknown error"
+      `Failed to store token data: ${error instanceof Error ? error.message : "Unknown error"
       }`
     );
   }
@@ -413,8 +536,7 @@ export const updateTokenSignatureLaunchlab = async (
   } catch (error) {
     console.error("Failed to store token data:", error);
     throw new Error(
-      `Failed to store token data: ${
-        error instanceof Error ? error.message : "Unknown error"
+      `Failed to store token data: ${error instanceof Error ? error.message : "Unknown error"
       }`
     );
   }
@@ -424,123 +546,208 @@ export const makeBuyIx = async (
   buyAmount: number,
   mintAddress: PublicKey
 ) => {
-  const buyInstruction: TransactionInstruction[] = [];
-  const lamports = buyAmount;
+  try {
+    console.log("\n=== Starting makeBuyIx ===");
+    console.log("Buyer Public Key:", kp.publicKey.toString());
+    console.log("Buy Amount (lamports):", buyAmount);
+    console.log("Mint Address:", mintAddress.toString());
 
-  console.log("launchpad programId:", LAUNCHPAD_PROGRAM.toBase58());
-  const programId = LAUNCHPAD_PROGRAM;
+    // Add validation for buyAmount
+    if (buyAmount <= 0) {
+      throw new Error(`Invalid buy amount: ${buyAmount}. Must be greater than 0`);
+    }
+    if (buyAmount < LAMPORTS_PER_SOL * 0.01) { // Minimum 0.01 SOL
+      throw new Error(`Buy amount too small: ${buyAmount}. Minimum is ${LAMPORTS_PER_SOL * 0.01} lamports (0.01 SOL)`);
+    }
 
-  const configId = getPdaLaunchpadConfigId(
-    programId,
-    NATIVE_MINT,
-    0,
-    0
-  ).publicKey;
+    const buyInstruction: TransactionInstruction[] = [];
+    const lamports = buyAmount;
 
-  const poolId = getPdaLaunchpadPoolId(
-    programId,
-    mintAddress,
-    NATIVE_MINT
-  ).publicKey;
-  console.log("🚀 ~ makeBuyTx ~ poolId:", poolId);
+    console.log("\n=== Program and Configuration ===");
+    const programId = LAUNCHPAD_PROGRAM;
+    console.log("Launchpad Program ID:", programId.toString());
 
-  const userTokenAccountA = getAssociatedTokenAddressSync(
-    mintAddress,
-    kp.publicKey
-  );
-  console.log("🚀 ~ makeBuyTx ~ userTokenAccountA:", userTokenAccountA);
+    const configId = getPdaLaunchpadConfigId(
+      programId,
+      NATIVE_MINT,
+      0,
+      0
+    ).publicKey;
+    console.log("Config ID:", configId.toString());
 
-  const userTokenAccountB = getAssociatedTokenAddressSync(
-    NATIVE_MINT,
-    kp.publicKey
-  );
-  console.log("🚀 ~ makeBuyTx ~ userTokenAccountB:", userTokenAccountB);
+    const poolId = getPdaLaunchpadPoolId(
+      programId,
+      mintAddress,
+      NATIVE_MINT
+    ).publicKey;
+    console.log("Pool ID:", poolId.toString());
 
-  const rentExemptionAmount =
-    await connection.getMinimumBalanceForRentExemption(165);
-  console.log("🚀 ~ makeBuyTx ~ rentExemptionAmount:", rentExemptionAmount);
+    console.log("\n=== Token Accounts ===");
+    const userTokenAccountA = getAssociatedTokenAddressSync(
+      mintAddress,
+      kp.publicKey
+    );
+    console.log("User Token Account A (mint):", userTokenAccountA.toString());
 
-  const buyerBalance = await connection.getBalance(kp.publicKey);
-  console.log("🚀 ~ makeBuyTx ~ buyerBalance:", buyerBalance);
+    const userTokenAccountB = getAssociatedTokenAddressSync(
+      NATIVE_MINT,
+      kp.publicKey
+    );
+    console.log("User Token Account B (WSOL):", userTokenAccountB.toString());
 
-  const requiredBalance = rentExemptionAmount * 2 + lamports;
-  console.log("🚀 ~ makeBuyTx ~ requiredBalance:", requiredBalance);
+    console.log("\n=== Balance and Rent ===");
+    const rentExemptionAmount = await connection.getMinimumBalanceForRentExemption(165);
+    console.log("Rent Exemption Amount:", rentExemptionAmount);
 
-  const vaultA = getPdaLaunchpadVaultId(
-    programId,
-    poolId,
-    mintAddress
-  ).publicKey;
-  console.log("🚀 ~ makeBuyTx ~ vaultA:", vaultA);
+    const buyerBalance = await connection.getBalance(kp.publicKey);
+    console.log("Buyer SOL Balance (lamports):", buyerBalance);
+    console.log("Buyer SOL Balance (SOL):", buyerBalance / LAMPORTS_PER_SOL);
 
-  const vaultB = getPdaLaunchpadVaultId(
-    programId,
-    poolId,
-    NATIVE_MINT
-  ).publicKey;
-  console.log("🚀 ~ makeBuyTx ~ vaultB:", vaultB);
+    const requiredBalance = rentExemptionAmount * 2 + lamports;
+    console.log("Required Balance (lamports):", requiredBalance);
+    console.log("Required Balance (SOL):", requiredBalance / LAMPORTS_PER_SOL);
+    console.log("Sufficient Balance:", buyerBalance >= requiredBalance ? "✅" : "❌");
 
-  const shareATA = getATAAddress(kp.publicKey, NATIVE_MINT).publicKey;
-  console.log("🚀 ~ makeBuyTx ~ shareATA:", shareATA);
+    if (buyerBalance < requiredBalance) {
+      throw new Error(`Insufficient balance. Need ${requiredBalance} lamports (${requiredBalance / LAMPORTS_PER_SOL} SOL), but only have ${buyerBalance} lamports (${buyerBalance / LAMPORTS_PER_SOL} SOL)`);
+    }
 
-  const authProgramId = getPdaLaunchpadAuth(programId).publicKey;
-  console.log("🚀 ~ makeBuyTx ~ authProgramId:", authProgramId);
+    console.log("\n=== Vaults and ATAs ===");
+    const vaultA = getPdaLaunchpadVaultId(
+      programId,
+      poolId,
+      mintAddress
+    ).publicKey;
+    console.log("Vault A (mint):", vaultA.toString());
 
-  const minmintAmount = new BN(1);
+    const vaultB = getPdaLaunchpadVaultId(
+      programId,
+      poolId,
+      NATIVE_MINT
+    ).publicKey;
+    console.log("Vault B (WSOL):", vaultB.toString());
 
-  const tokenAta = await getAssociatedTokenAddress(mintAddress, kp.publicKey);
-  console.log("🚀 ~ makeBuyTx ~ tokenAta:", tokenAta);
+    const shareATA = getATAAddress(kp.publicKey, NATIVE_MINT).publicKey;
+    console.log("Share ATA:", shareATA.toString());
 
-  const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, kp.publicKey);
-  console.log("🚀 ~ makeBuyTx ~ wsolAta:", wsolAta);
+    const authProgramId = getPdaLaunchpadAuth(programId).publicKey;
+    console.log("Auth Program ID:", authProgramId.toString());
 
-  buyInstruction.push(
-    createAssociatedTokenAccountIdempotentInstruction(
+    // Increased minmintAmount from 1000 to 1,000,000,000 (1 token with 9 decimals)
+    const minmintAmount = new BN(1000000000);
+    console.log("Minimum Mint Amount:", minmintAmount.toString());
+
+    // Rest of the function remains the same...
+    console.log("\n=== Creating Token ATAs ===");
+    const tokenAta = await getAssociatedTokenAddress(mintAddress, kp.publicKey);
+    console.log("Token ATA:", tokenAta.toString());
+
+    const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, kp.publicKey);
+    console.log("WSOL ATA:", wsolAta.toString());
+
+    console.log("\n=== Building Instructions ===");
+    // Create token accounts if they don't exist
+    const createTokenAccountIx = createAssociatedTokenAccountIdempotentInstruction(
       kp.publicKey,
       tokenAta,
       kp.publicKey,
       mintAddress
-    ),
-    createAssociatedTokenAccountIdempotentInstruction(
+    );
+    console.log("Created Create Token Account Instruction");
+
+    const createWsolAccountIx = createAssociatedTokenAccountIdempotentInstruction(
       kp.publicKey,
       wsolAta,
       kp.publicKey,
       NATIVE_MINT
-    ),
-    SystemProgram.transfer({
+    );
+    console.log("Created Create WSOL Account Instruction");
+
+    const transferIx = SystemProgram.transfer({
       fromPubkey: kp.publicKey,
       toPubkey: wsolAta,
       lamports,
-    }),
-    createSyncNativeInstruction(wsolAta)
-  );
+    });
+    console.log(`Created Transfer Instruction: ${lamports} lamports to WSOL ATA`);
 
-  const instruction = buyExactInInstruction(
-    programId,
-    kp.publicKey,
-    authProgramId,
-    configId,
-    BONK_PLATFROM_ID,
-    poolId,
-    userTokenAccountA,
-    userTokenAccountB,
-    vaultA,
-    vaultB,
-    mintAddress,
-    NATIVE_MINT,
-    TOKEN_PROGRAM_ID,
-    TOKEN_PROGRAM_ID,
-    kp.publicKey,
-    kp.publicKey,
-    new BN(lamports),
-    minmintAmount,
-    new BN(100),
-    shareATA
-  );
+    const syncNativeIx = createSyncNativeInstruction(wsolAta);
+    console.log("Created Sync Native Instruction");
 
-  console.log("🚀 ~ makeBuyTx ~ instruction:", instruction);
-  buyInstruction.push(instruction);
-  console.log("🚀 ~ makeBuyTx ~ buyInstruction:", buyInstruction);
+    buyInstruction.push(
+      createTokenAccountIx,
+      createWsolAccountIx,
+      transferIx,
+      syncNativeIx
+    );
 
-  return buyInstruction;
+    console.log("\n=== Creating Buy Exact In Instruction ===");
+    const inputParams = {
+      programId: programId.toString(),
+      payer: kp.publicKey.toString(),
+      authProgramId: authProgramId.toString(),
+      configId: configId.toString(),
+      platformId: BONK_PLATFROM_ID.toString(),
+      poolId: poolId.toString(),
+      userTokenAccountA: userTokenAccountA.toString(),
+      userTokenAccountB: userTokenAccountB.toString(),
+      vaultA: vaultA.toString(),
+      vaultB: vaultB.toString(),
+      mintAddress: mintAddress.toString(),
+      nativeMint: NATIVE_MINT.toString(),
+      tokenProgramId: TOKEN_PROGRAM_ID.toString(),
+      lamports,
+      minmintAmount: minmintAmount.toString(),
+      shareATA: shareATA.toString()
+    };
+    console.log("Input parameters:", JSON.stringify(inputParams, null, 2));
+
+    // Fetch the associated token program ID
+    const { ASSOCIATED_TOKEN_PROGRAM_ID } = await import('@solana/spl-token');
+
+    const instruction = buyExactInInstruction(
+      programId,                      // programId
+      kp.publicKey,                   // payer
+      authProgramId,                  // authProgramId
+      configId,                       // configId
+      BONK_PLATFROM_ID,               // platformId
+      poolId,                         // poolId
+      userTokenAccountA,              // userTokenAccountA
+      userTokenAccountB,              // userTokenAccountB
+      vaultA,                         // vaultA
+      vaultB,                         // vaultB
+      mintAddress,                    // mintA
+      NATIVE_MINT,                    // mintB (native mint)
+      TOKEN_PROGRAM_ID,               // tokenProgramId - Standard token program
+      ASSOCIATED_TOKEN_PROGRAM_ID,    // associatedTokenProgramId - NOT TOKEN_PROGRAM_ID again!
+      kp.publicKey,                   // userTransferAuthority
+      kp.publicKey,                   // userShareAuthority
+      new BN(lamports),               // buyAmount
+      minmintAmount,                  // minMintAmount
+      new BN(500),                    // slippageTolerance (500 = 5%)
+      shareATA                        // shareATA
+    );
+
+    console.log("\n=== Buy Exact In Instruction Created ===");
+    console.log("Instruction Program ID:", instruction.programId.toString());
+    console.log("Instruction Keys:", instruction.keys.map((k, i) =>
+      `${i}: ${k.pubkey.toString()} (signer: ${k.isSigner}, writable: ${k.isWritable})`
+    ));
+
+    buyInstruction.push(instruction);
+    console.log("\n=== Final Instructions ===");
+    buyInstruction.forEach((ix, i) => {
+      console.log(`Instruction ${i}: ${ix.programId.toString()}`);
+    });
+
+    console.log("\n=== makeBuyIx Completed Successfully ===\n");
+    return buyInstruction;
+  } catch (error) {
+    console.error("\n!!! Error in makeBuyIx !!!");
+    console.error("Error details:", error);
+    if (error instanceof Error) {
+      console.error("Error message:", error.message);
+      console.error("Stack trace:", error.stack);
+    }
+    throw error;
+  }
 };
