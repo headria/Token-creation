@@ -12,6 +12,7 @@ lerna-debug.log*
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
+dist
 
 todoList.ts
 # Runtime data
@@ -48,6 +49,9 @@ build/Release
 node_modules
 node_modules/
 jspm_packages/
+./dist
+/dist
+../dist
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
